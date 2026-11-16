@@ -1,1090 +1,851 @@
-// THE BOOK THAT CONTAINED THE SEA — one image, drawn entirely in code.
+// The Book That Contained the Sea
 //
-// A dark old library at night. On a wooden table lies an open book, its pages
-// glowing warm — and out of the book a towering ocean wave is erupting,
-// curling over the room, deep indigo water shot through with molten-gold
-// light and tiny stars, its crest breaking into spray. A tiny lighthouse
-// stands on the other page, its beam cutting through the spray; at the
-// table's edge a tiny reader leaps back in shock, chair toppling.
+// A procedural painting drawn entirely in code: a dark library at night,
+// an open book glowing gold on a wooden table, and a towering indigo wave
+// erupting from its pages. A tiny lighthouse stands on the left page; a
+// tiny reader leaps back as a chair topples and loose pages flutter through
+// the spray. Warm gold against deep blue shadow, painterly, diagonal.
 //
-// Everything is computed: painterly layers of shaded shapes, a precomputed
-// wave distance field, particle splats, glow fields and seeded grain. A
-// fixed-seed PRNG drives every placement — no Math.random, no clock — so two
-// runs produce byte-identical output.
-//
-// Pipeline, in order: the wave's Catmull-Rom spine is baked into distance /
-// parameter / radius grids; five noise fields and a warm glow field are
-// precomputed alongside; every spray droplet, star, mote and fluttering page
-// is splatted into an additive buffer by seeded PRNGs; then each output
-// pixel shades the room, the book, the wave and the silhouettes from those
-// fields at 2x supersampling, and a filmic shoulder plus seeded grain finish
-// the frame before the hand-rolled PNG encoder writes it out.
-//
-// Node 22, standard library only. Writes <outputDir>/entry.png where
-// outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output'.
-
+// Node 22, standard library only. Seeded randomness throughout: two runs
+// produce byte-identical output.
 import { deflateSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-// ---------------------------------------------------------------------------
-// Deterministic PRNG + hashing (never Math.random / Date.now)
-// ---------------------------------------------------------------------------
-
+// ---------------- deterministic randomness ----------------
 function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+const rand = mulberry32(0x51ab00c);
+function rr(a: number, b: number): number {
+  return a + rand() * (b - a);
+}
+function pick<T>(arr: readonly T[]): T {
+  return arr[Math.floor(rand() * arr.length)];
+}
 
-/** Integer lattice hash -> [0, 1). Stable across runs and platforms. */
-function hash2(x: number, y: number): number {
-  let h = Math.imul(x, 374761393) + Math.imul(y, 668265263);
+// ---------------- value noise ----------------
+function hash2(ix: number, iy: number): number {
+  let h = (Math.imul(ix, 374761393) + Math.imul(iy, 668265263)) | 0;
   h = Math.imul(h ^ (h >>> 13), 1274126177);
-  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+  return (((h ^ (h >>> 16)) >>> 0) % 100000) / 100000;
 }
-
-function smootherstep(t: number): number {
-  return t * t * t * (t * (t * 6 - 15) + 10);
-}
-
-/** Smooth value noise, 1 octave. */
-function vnoise(x: number, y: number): number {
-  const xi = Math.floor(x);
-  const yi = Math.floor(y);
-  const xf = x - xi;
-  const yf = y - yi;
-  const u = smootherstep(xf);
-  const v = smootherstep(yf);
-  const a = hash2(xi, yi);
-  const b = hash2(xi + 1, yi);
-  const c = hash2(xi, yi + 1);
-  const d = hash2(xi + 1, yi + 1);
-  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
-}
-
-/** Fractal noise in [0, 1]. */
-function fbm(x: number, y: number, octaves: number): number {
-  let sum = 0;
-  let amp = 0.55;
-  let freq = 1;
-  let norm = 0;
-  for (let i = 0; i < octaves; i++) {
-    sum += amp * vnoise(x * freq, y * freq);
-    norm += amp;
-    amp *= 0.5;
-    freq *= 2.03;
-  }
-  return sum / norm;
-}
-
-// ---------------------------------------------------------------------------
-// Small math helpers
-// ---------------------------------------------------------------------------
-
-type RGB = [number, number, number];
-
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
-}
-function clamp01(v: number): number {
-  return v < 0 ? 0 : v > 1 ? 1 : v;
-}
-function mix(a: number, b: number, t: number): number {
-  return a + (b - a) * t;
-}
-function mixc(a: RGB, b: RGB, t: number): RGB {
-  return [mix(a[0], b[0], t), mix(a[1], b[1], t), mix(a[2], b[2], t)];
-}
-function smoothstep(lo: number, hi: number, v: number): number {
-  const t = clamp((v - lo) / (hi - lo), 0, 1);
+function sm(t: number): number {
   return t * t * (3 - 2 * t);
 }
-function dist2d(x0: number, y0: number, x1: number, y1: number): number {
+function vnoise(x: number, y: number): number {
+  const ix = Math.floor(x);
+  const iy = Math.floor(y);
+  const fx = x - ix;
+  const fy = y - iy;
+  const a = hash2(ix, iy);
+  const b = hash2(ix + 1, iy);
+  const c = hash2(ix, iy + 1);
+  const d = hash2(ix + 1, iy + 1);
+  const u = sm(fx);
+  const v = sm(fy);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+function fbm(x: number, y: number, oct: number): number {
+  let s = 0;
+  let amp = 0.5;
+  let f = 1;
+  let norm = 0;
+  for (let i = 0; i < oct; i++) {
+    s += amp * vnoise(x * f, y * f);
+    norm += amp;
+    amp *= 0.5;
+    f *= 2.03;
+  }
+  return s / norm;
+}
+
+// ---------------- canvas ----------------
+const W = 1024;
+const H = 1024;
+const buf = new Float32Array(W * H * 3);
+type C = [number, number, number];
+type Pt = [number, number];
+
+function mix(a: C, b: C, t: number): C {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+}
+function shade(c: C, f: number): C {
+  return [c[0] * f, c[1] * f, c[2] * f];
+}
+
+function blend(x: number, y: number, r: number, g: number, b: number, a: number): void {
+  const xi = x | 0;
+  const yi = y | 0;
+  if (xi < 0 || yi < 0 || xi >= W || yi >= H) return;
+  const i = (yi * W + xi) * 3;
+  buf[i] += (r - buf[i]) * a;
+  buf[i + 1] += (g - buf[i + 1]) * a;
+  buf[i + 2] += (b - buf[i + 2]) * a;
+}
+
+// Soft-edged ellipse, optionally rotated.
+function blob(cx: number, cy: number, rx: number, ry: number, rot: number, c: C, a: number, feather = 0.4): void {
+  const cos = Math.cos(rot);
+  const sin = Math.sin(rot);
+  const half = Math.hypot(rx, ry) + 2;
+  const x0 = Math.max(0, Math.floor(cx - half));
+  const x1 = Math.min(W - 1, Math.ceil(cx + half));
+  const y0 = Math.max(0, Math.floor(cy - half));
+  const y1 = Math.min(H - 1, Math.ceil(cy + half));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const dx = x + 0.5 - cx;
+      const dy = y + 0.5 - cy;
+      const u = (cos * dx + sin * dy) / rx;
+      const v = (-sin * dx + cos * dy) / ry;
+      const d = u * u + v * v;
+      if (d >= 1) continue;
+      let e = (1 - d) / feather;
+      if (e > 1) e = 1;
+      e = e * e * (3 - 2 * e);
+      blend(x, y, c[0], c[1], c[2], a * e);
+    }
+  }
+}
+
+function disc(cx: number, cy: number, r: number, c: C, a: number): void {
+  blob(cx, cy, r, r, 0, c, a, 0.35);
+}
+
+// Soft radial glow.
+function glow(cx: number, cy: number, rad: number, c: C, a: number, power = 2): void {
+  const x0 = Math.max(0, Math.floor(cx - rad));
+  const x1 = Math.min(W - 1, Math.ceil(cx + rad));
+  const y0 = Math.max(0, Math.floor(cy - rad));
+  const y1 = Math.min(H - 1, Math.ceil(cy + rad));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const d = Math.hypot(x + 0.5 - cx, y + 0.5 - cy) / rad;
+      if (d >= 1) continue;
+      const f = Math.pow(1 - d, power);
+      blend(x, y, c[0], c[1], c[2], a * f);
+    }
+  }
+}
+
+// Scanline polygon fill (even-odd).
+function poly(pts: Pt[], c: C, a: number): void {
+  let minY = 1e9;
+  let maxY = -1e9;
+  for (const p of pts) {
+    if (p[1] < minY) minY = p[1];
+    if (p[1] > maxY) maxY = p[1];
+  }
+  const y0 = Math.max(0, Math.floor(minY));
+  const y1 = Math.min(H - 1, Math.ceil(maxY));
+  for (let y = y0; y <= y1; y++) {
+    const yc = y + 0.5;
+    const xs: number[] = [];
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      const q = pts[(i + 1) % pts.length];
+      if ((p[1] <= yc && q[1] > yc) || (q[1] <= yc && p[1] > yc)) {
+        const t = (yc - p[1]) / (q[1] - p[1]);
+        xs.push(p[0] + t * (q[0] - p[0]));
+      }
+    }
+    xs.sort((m, n) => m - n);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const xa = Math.max(0, Math.ceil(xs[k]));
+      const xb = Math.min(W - 1, Math.floor(xs[k + 1]));
+      for (let x = xa; x <= xb; x++) blend(x, y, c[0], c[1], c[2], a);
+    }
+  }
+}
+
+// Rotated rectangle centred at (cx, cy).
+function quad(cx: number, cy: number, w: number, h: number, angle: number, c: C, a: number): void {
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const hw = w / 2;
+  const hh = h / 2;
+  const corners: Pt[] = [
+    [-hw, -hh],
+    [hw, -hh],
+    [hw, hh],
+    [-hw, hh],
+  ].map(([lx, ly]): Pt => [cx + lx * cos - ly * sin, cy + lx * sin + ly * cos]);
+  poly(corners, c, a);
+}
+
+// Thick soft line segment.
+function seg(x0: number, y0: number, x1: number, y1: number, w: number, c: C, a: number): void {
   const dx = x1 - x0;
   const dy = y1 - y0;
-  return Math.sqrt(dx * dx + dy * dy);
-}
-function sdCapsule(px: number, py: number, ax: number, ay: number, bx: number, by: number, r: number): number {
-  const pax = px - ax;
-  const pay = py - ay;
-  const bax = bx - ax;
-  const bay = by - ay;
-  const h = clamp((pax * bax + pay * bay) / (bax * bax + bay * bay), 0, 1);
-  const dx = pax - bax * h;
-  const dy = pay - bay * h;
-  return Math.sqrt(dx * dx + dy * dy) - r;
-}
-function sdBox(px: number, py: number, cx: number, cy: number, hx: number, hy: number, rot: number): number {
-  const c = Math.cos(rot);
-  const s = Math.sin(rot);
-  const dx = px - cx;
-  const dy = py - cy;
-  const lx = c * dx + s * dy;
-  const ly = -s * dx + c * dy;
-  const qx = Math.abs(lx) - hx;
-  const qy = Math.abs(ly) - hy;
-  const ox = Math.max(qx, 0);
-  const oy = Math.max(qy, 0);
-  return Math.sqrt(ox * ox + oy * oy) + Math.min(Math.max(qx, qy), 0);
+  const len2 = dx * dx + dy * dy || 1;
+  const pad = w / 2 + 3;
+  const xa = Math.max(0, Math.floor(Math.min(x0, x1) - pad));
+  const xb = Math.min(W - 1, Math.ceil(Math.max(x0, x1) + pad));
+  const ya = Math.max(0, Math.floor(Math.min(y0, y1) - pad));
+  const yb = Math.min(H - 1, Math.ceil(Math.max(y0, y1) + pad));
+  for (let y = ya; y <= yb; y++) {
+    for (let x = xa; x <= xb; x++) {
+      let t = ((x + 0.5 - x0) * dx + (y + 0.5 - y0) * dy) / len2;
+      if (t < 0) t = 0;
+      if (t > 1) t = 1;
+      const px = x0 + t * dx;
+      const py = y0 + t * dy;
+      const d = Math.hypot(x + 0.5 - px, y + 0.5 - py);
+      if (d >= w / 2 + 1.5) continue;
+      let e = (w / 2 + 1.5 - d) / 3;
+      if (e > 1) e = 1;
+      e = e * e * (3 - 2 * e);
+      blend(x, y, c[0], c[1], c[2], a * e);
+    }
+  }
 }
 
-// ---------------------------------------------------------------------------
-// PNG encoder (truecolor RGB8, per-row best filter, correct CRC32)
-// ---------------------------------------------------------------------------
+function vgrad(x0: number, y0: number, x1: number, y1: number, top: C, bot: C): void {
+  for (let y = y0; y < y1; y++) {
+    const t = (y - y0) / Math.max(1, y1 - y0 - 1);
+    const r = top[0] + (bot[0] - top[0]) * t;
+    const g = top[1] + (bot[1] - top[1]) * t;
+    const b = top[2] + (bot[2] - top[2]) * t;
+    for (let x = x0; x < x1; x++) {
+      const i = (y * W + x) * 3;
+      buf[i] = r;
+      buf[i + 1] = g;
+      buf[i + 2] = b;
+    }
+  }
+}
 
-const CRC_TABLE: Int32Array = (() => {
-  const table = new Int32Array(256);
+function rect(x0: number, y0: number, x1: number, y1: number, c: C, a: number): void {
+  const xa = Math.max(0, Math.floor(x0));
+  const xb = Math.min(W - 1, Math.ceil(x1));
+  const ya = Math.max(0, Math.floor(y0));
+  const yb = Math.min(H - 1, Math.ceil(y1));
+  for (let y = ya; y <= yb; y++) {
+    for (let x = xa; x <= xb; x++) blend(x, y, c[0], c[1], c[2], a);
+  }
+}
+
+// Catmull-Rom spline through control points.
+function catmull(pts: Pt[], per: number): Pt[] {
+  const out: Pt[] = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[Math.min(pts.length - 1, i + 2)];
+    for (let j = 0; j < per; j++) {
+      const t = j / per;
+      const t2 = t * t;
+      const t3 = t2 * t;
+      const x =
+        0.5 *
+        (2 * p1[0] +
+          (-p0[0] + p2[0]) * t +
+          (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
+          (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
+      const y =
+        0.5 *
+        (2 * p1[1] +
+          (-p0[1] + p2[1]) * t +
+          (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
+          (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3);
+      out.push([x, y]);
+    }
+  }
+  out.push(pts[pts.length - 1]);
+  return out;
+}
+
+// ---------------- scene ----------------
+const GOLD: C = [232, 182, 96];
+const GOLD_HI: C = [255, 216, 132];
+const CREAM: C = [236, 221, 182];
+const INDIGO: C = [12, 26, 62];
+const INDIGO_MID: C = [18, 48, 92];
+const TEAL: C = [48, 112, 142];
+const FOAM: C = [240, 244, 250];
+const DARK: C = [10, 12, 22];
+
+function paintBackground(): void {
+  vgrad(0, 0, W, H, [11, 14, 30], [4, 5, 12]);
+  // Mottled wall texture, subtle.
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const n = fbm(x * 0.012, y * 0.012, 2);
+      const m = 0.93 + 0.14 * n;
+      const i = (y * W + x) * 3;
+      buf[i] *= m;
+      buf[i + 1] *= m;
+      buf[i + 2] *= m;
+    }
+  }
+  // Cool moonlit wash high on the wall, very faint.
+  glow(512, 90, 520, [46, 66, 110], 0.16, 2);
+}
+
+const BOOK_COLORS: C[] = [
+  [96, 52, 44],
+  [74, 88, 110],
+  [110, 96, 60],
+  [88, 74, 66],
+  [70, 96, 70],
+  [120, 84, 96],
+  [60, 70, 84],
+  [140, 110, 70],
+  [100, 64, 84],
+  [84, 100, 92],
+];
+
+function paintShelves(): void {
+  const rows = [36, 176, 316, 456, 596, 736];
+  for (const side of [0, 1]) {
+    const x0 = side === 0 ? 10 : 834;
+    const x1 = side === 0 ? 190 : 1014;
+    // Shelf carcass.
+    rect(x0 - 4, 20, x1 + 4, 812, [24, 15, 9], 1);
+    rect(x0, 20, x1, 812, [14, 9, 5], 1);
+    for (const ry of rows) {
+      // Books on this shelf.
+      let x = x0 + 4;
+      const boardY = ry + 132;
+      while (x < x1 - 18) {
+        const bw = rr(15, 30);
+        const bh = rr(86, 128);
+        const base = pick(BOOK_COLORS);
+        const dim = rr(0.42, 0.8);
+        const col = shade(base, dim);
+        const lean = rand() < 0.09;
+        if (lean) {
+          quad(x + bw / 2, boardY - bh / 2, bw, bh, 0.16, col, 1);
+        } else {
+          rect(x, boardY - bh, x + bw, boardY, col, 1);
+          // Lighter top edge and a band.
+          rect(x, boardY - bh, x + bw, boardY - bh + 2, shade(col, 1.35), 0.7);
+          if (rand() < 0.55) {
+            rect(x, boardY - bh + rr(24, 44), x + bw, boardY - bh + rr(26, 48), shade(col, 1.5), 0.5);
+          }
+        }
+        x += bw + rr(0, 3);
+      }
+      // A flat stack on some shelves.
+      if (rand() < 0.5) {
+        const sx = x0 + rr(20, 90);
+        const sw = rr(56, 84);
+        rect(sx, boardY - 26, sx + sw, boardY - 14, shade(pick(BOOK_COLORS), rr(0.4, 0.7)), 1);
+        rect(sx + 4, boardY - 38, sx + sw - 6, boardY - 26, shade(pick(BOOK_COLORS), rr(0.4, 0.7)), 1);
+      }
+      // Shelf board.
+      rect(x0, boardY, x1, boardY + 9, [40, 26, 15], 1);
+      rect(x0, boardY + 9, x1, boardY + 11, [18, 11, 6], 1);
+    }
+    // Dim the whole shelf unit toward the dark room.
+    rect(x0 - 4, 20, x1 + 4, 812, [6, 7, 14], 0.22);
+  }
+}
+
+function paintTable(): void {
+  vgrad(0, 800, W, H, [66, 38, 20], [28, 15, 8]);
+  // Horizontal wood grain.
+  for (let y = 800; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const n = fbm(x * 0.006, y * 0.055, 2);
+      const m = 0.9 + 0.2 * n;
+      const i = (y * W + x) * 3;
+      buf[i] *= m;
+      buf[i + 1] *= m;
+      buf[i + 2] *= m;
+    }
+  }
+  // Plank seams and a couple of knots.
+  for (const sx of [248, 522, 792]) {
+    seg(sx, 802, sx + 14, 1024, 3, [16, 8, 4], 0.3);
+  }
+  blob(300, 950, 26, 9, 0.2, [20, 10, 5], 0.5);
+  blob(760, 1010, 30, 10, -0.15, [20, 10, 5], 0.45);
+  // Front edge highlight.
+  seg(0, 800, W, 800, 2, [126, 84, 46], 0.55);
+  // Warm pool of light around the book.
+  glow(512, 884, 430, GOLD, 0.3, 2);
+  // A small stack of books resting on the table, left of the open book.
+  quad(238, 916, 96, 14, 0.02, shade([74, 88, 110], 0.7), 1);
+  quad(240, 900, 88, 14, -0.03, shade([96, 52, 44], 0.75), 1);
+  quad(242, 885, 78, 13, 0.04, shade([110, 96, 60], 0.7), 1);
+}
+
+function paintLightWash(): void {
+  // Diffuse golden wash rising from the book, and faint cool rim above.
+  blob(320, 480, 250, 330, 0.15, GOLD, 0.07, 0.6);
+  blob(760, 300, 220, 260, -0.1, [70, 100, 150], 0.06, 0.6);
+}
+
+function paintBook(): void {
+  // Under-glow first, so the pages sit in the light.
+  glow(512, 892, 170, GOLD_HI, 0.85, 2);
+  glow(512, 892, 300, GOLD, 0.4, 2);
+  // Covers (dark red-brown) peeking out from under the pages.
+  poly(
+    [
+      [376, 856],
+      [512, 836],
+      [512, 956],
+      [382, 964],
+    ],
+    [74, 30, 22],
+    1,
+  );
+  poly(
+    [
+      [512, 836],
+      [648, 856],
+      [642, 964],
+      [512, 956],
+    ],
+    [74, 30, 22],
+    1,
+  );
+  // Pages.
+  poly(
+    [
+      [386, 860],
+      [512, 842],
+      [512, 950],
+      [392, 958],
+    ],
+    CREAM,
+    1,
+  );
+  poly(
+    [
+      [512, 842],
+      [640, 860],
+      [634, 958],
+      [512, 950],
+    ],
+    CREAM,
+    1,
+  );
+  // Bright core near the spine: the light lives in the book.
+  glow(512, 895, 105, [255, 226, 150], 0.5, 2);
+  // Spine shadow.
+  seg(512, 840, 512, 954, 4, [60, 38, 18], 0.6);
+  // Faint lines of text on the pages.
+  for (const side of [0, 1]) {
+    for (let k = 0; k < 5; k++) {
+      const y = 872 + k * 14;
+      const xA = side === 0 ? 406 + k * 2 : 530 + k * 1;
+      const xB = side === 0 ? 500 - k * 3 : 624 - k * 2;
+      seg(xA, y, xB, y + (side === 0 ? -3 : 3), 1.6, [120, 100, 70], 0.4);
+    }
+  }
+}
+
+function paintLighthouse(): void {
+  // A tiny lighthouse, impossibly real, standing on the left page.
+  // Soft shadow on the page.
+  blob(452, 852, 12, 3.5, 0, [30, 20, 10], 0.4);
+  // Rock base.
+  blob(452, 849, 11, 5, 0, [52, 48, 44], 1);
+  // Tower: white with two red bands.
+  poly(
+    [
+      [446, 850],
+      [458, 850],
+      [456, 818],
+      [448, 818],
+    ],
+    [236, 234, 224],
+    1,
+  );
+  poly(
+    [
+      [447, 840],
+      [457, 840],
+      [456.6, 832],
+      [447.4, 832],
+    ],
+    [172, 52, 42],
+    1,
+  );
+  poly(
+    [
+      [448, 826],
+      [456, 826],
+      [455.6, 820],
+      [448.4, 820],
+    ],
+    [172, 52, 42],
+    1,
+  );
+  // Lamp room and its light.
+  rect(447, 813, 457, 819, [18, 16, 14], 1);
+  disc(452, 811, 3, GOLD_HI, 1);
+  glow(452, 811, 16, GOLD_HI, 0.8, 2);
+  // A narrow beam sweeping up-left across the room.
+  poly(
+    [
+      [452, 811],
+      [372, 748],
+      [386, 776],
+    ],
+    GOLD_HI,
+    0.16,
+  );
+}
+
+function paintWave(): void {
+  const ctrl: Pt[] = [
+    [560, 918],
+    [548, 800],
+    [512, 645],
+    [472, 495],
+    [468, 360],
+    [512, 252],
+    [600, 178],
+    [708, 162],
+    [798, 212],
+    [848, 300],
+    [846, 392],
+  ];
+  const widths = [196, 186, 162, 148, 136, 124, 110, 96, 80, 64, 50];
+  const spine = catmull(ctrl, 12);
+  const n = spine.length;
+  const hollow: Pt = [705, 335];
+
+  // Pass A — the water body, overlapping soft blobs along the spine.
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    const [x, y] = spine[i];
+    const w = widths[Math.min(widths.length - 1, Math.floor(t * (widths.length - 1)))];
+    const r = w / 2;
+    const nx = spine[Math.min(n - 1, i + 1)][0] - spine[Math.max(0, i - 1)][0];
+    const ny = spine[Math.min(n - 1, i + 1)][1] - spine[Math.max(0, i - 1)][1];
+    const ang = Math.atan2(ny, nx);
+    const streak = fbm(t * 8.0, 0.63, 2);
+    let col = mix(INDIGO, INDIGO_MID, Math.min(1, Math.max(0, 0.2 + 0.7 * streak)));
+    col = mix(col, TEAL, Math.min(1, Math.max(0, (streak - 0.42) * 1.4)) * 0.35);
+    let goldF = (y - 620) / 300;
+    if (goldF < 0) goldF = 0;
+    if (goldF > 1) goldF = 1;
+    goldF *= goldF;
+    col = mix(col, GOLD, goldF * 0.42);
+    col = mix(col, [70, 120, 158], t * 0.1);
+    blob(x, y, r * 1.28, r * 0.96, ang, col, 0.92, 0.45);
+  }
+
+  // Pass B — the dark hollow inside the curl.
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    if (t < 0.52) continue;
+    const [x, y] = spine[i];
+    const w = widths[Math.min(widths.length - 1, Math.floor(t * (widths.length - 1)))];
+    const r = w / 2;
+    let dx = hollow[0] - x;
+    let dy = hollow[1] - y;
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len;
+    dy /= len;
+    blob(x + dx * r * 0.42, y + dy * r * 0.42, r * 0.62, r * 0.58, 0, [9, 17, 40], 0.6, 0.5);
+  }
+
+  // Pass C — foam lace along the crest and the inner lip.
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    if (t < 0.58) continue;
+    const [x, y] = spine[i];
+    const w = widths[Math.min(widths.length - 1, Math.floor(t * (widths.length - 1)))];
+    const r = w / 2;
+    let dx = hollow[0] - x;
+    let dy = hollow[1] - y;
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len;
+    dy /= len;
+    // Outer crest edge.
+    blob(x - dx * r * 0.95 + rr(-6, 6), y - dy * r * 0.95 + rr(-6, 6), rr(3, 9), rr(2.5, 7), rr(0, 3), FOAM, rr(0.6, 0.95), 0.4);
+    // Inner lip.
+    blob(x + dx * r * 0.72 + rr(-4, 4), y + dy * r * 0.72 + rr(-4, 4), rr(2.5, 7), rr(2, 6), rr(0, 3), mix(FOAM, GOLD_HI, 0.25), rr(0.55, 0.9), 0.4);
+  }
+
+  // Pass D — cool rim light on the outer edge of the rising column.
+  for (let i = 0; i < n; i++) {
+    const t = i / (n - 1);
+    if (t > 0.62) continue;
+    const [x, y] = spine[i];
+    const w = widths[Math.min(widths.length - 1, Math.floor(t * (widths.length - 1)))];
+    const r = w / 2;
+    let dx = x - hollow[0];
+    let dy = y - hollow[1];
+    const len = Math.hypot(dx, dy) || 1;
+    dx /= len;
+    dy /= len;
+    blob(x + dx * r * 0.88, y + dy * r * 0.88, rr(2, 4.5), rr(1.5, 3.5), 0, [150, 190, 220], 0.16, 0.5);
+  }
+
+  // Pass E — the burst where the water leaves the book.
+  for (let k = 0; k < 14; k++) {
+    const a = rr(0, Math.PI * 2);
+    const d = Math.pow(rand(), 0.6) * 70;
+    const x = 540 + Math.cos(a) * d;
+    const y = 880 + Math.sin(a) * d * 0.7;
+    const col = rand() < 0.5 ? mix(FOAM, GOLD_HI, 0.45) : mix(GOLD_HI, FOAM, 0.3);
+    blob(x, y, rr(8, 34), rr(6, 24), rr(0, 3), col, rr(0.12, 0.32), 0.5);
+  }
+}
+
+function paintSpray(): void {
+  // Droplets around the crest.
+  for (let k = 0; k < 750; k++) {
+    const a = rr(0, Math.PI * 2);
+    const d = 280 * Math.pow(rand(), 1.6);
+    const x = 740 + Math.cos(a) * d * 1.15;
+    const y = 215 + Math.sin(a) * d * 0.85;
+    const col = rand() < 0.8 ? [210, 228, 248] : GOLD_HI;
+    disc(x, y, rr(0.7, 2.6), col, rr(0.1, 0.65));
+  }
+  // Droplets bursting from the book.
+  for (let k = 0; k < 420; k++) {
+    const a = rr(0, Math.PI * 2);
+    const d = 190 * Math.pow(rand(), 1.4);
+    const x = 540 + Math.cos(a) * d;
+    const y = 855 + Math.sin(a) * d * 0.7;
+    const col = rand() < 0.55 ? [240, 212, 150] : [214, 230, 246];
+    disc(x, y, rr(0.7, 2.4), col, rr(0.1, 0.6));
+  }
+  // A few fast streaks near the crest.
+  for (let k = 0; k < 46; k++) {
+    const x = rr(560, 940);
+    const y = rr(120, 380);
+    const ang = rr(-0.9, 0.4);
+    const len = rr(10, 34);
+    seg(x, y, x + Math.cos(ang) * len, y + Math.sin(ang) * len, rr(1, 2.2), [220, 232, 248], rr(0.15, 0.45));
+  }
+}
+
+function paintPage(cx: number, cy: number, w: number, h: number, angle: number): void {
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const hw = w / 2;
+  const hh = h / 2;
+  const corner = (lx: number, ly: number): Pt => [
+    cx + lx * cos - ly * sin,
+    cy + lx * sin + ly * cos,
+  ];
+  const pts: Pt[] = [corner(-hw, -hh), corner(hw, -hh), corner(hw, hh), corner(-hw, hh)];
+  // Soft shadow.
+  const sh: Pt[] = pts.map(([x, y]): Pt => [x + 5, y + 6]);
+  poly(sh, [8, 6, 4], 0.35);
+  poly(pts, CREAM, 1);
+  // Folded corner.
+  poly([corner(hw, hh), corner(hw - 12, hh), corner(hw, hh - 12)], [196, 176, 132], 1);
+  // Lines of text.
+  for (let k = 0; k < 3; k++) {
+    const ly = -hh + 12 + k * 10;
+    const p1 = corner(-hw + 7, ly);
+    const p2 = corner(hw - 7, ly + 2);
+    seg(p1[0], p1[1], p2[0], p2[1], 1.4, [122, 102, 72], 0.5);
+  }
+}
+
+function paintPages(): void {
+  const pages: [number, number, number, number, number][] = [
+    [690, 300, 42, 56, -0.42],
+    [770, 430, 40, 54, 0.21],
+    [645, 250, 38, 52, 0.66],
+    [835, 345, 44, 58, -0.14],
+    [395, 430, 40, 54, 0.31],
+    [735, 530, 42, 56, -0.52],
+    [890, 490, 38, 52, 0.1],
+    [565, 335, 36, 50, -0.24],
+  ];
+  for (const [x, y, w, h, a] of pages) paintPage(x, y, w, h, a);
+}
+
+function paintReaderChair(): void {
+  // The tiny reader, leaping back in shock — dark silhouette, gold rim.
+  const dark: C = [13, 11, 19];
+  const rim: C = [214, 168, 92];
+  const ox = 2;
+  const oy = 2;
+  // Rim pass (offset copy).
+  seg(838 + ox, 880 + oy, 836 + ox, 906 + oy, 7, rim, 0.5);
+  seg(838 + ox, 884 + oy, 820 + ox, 866 + oy, 5, rim, 0.5);
+  seg(838 + ox, 884 + oy, 856 + ox, 864 + oy, 5, rim, 0.5);
+  seg(836 + ox, 906 + oy, 824 + ox, 930 + oy, 5, rim, 0.5);
+  seg(836 + ox, 906 + oy, 850 + ox, 932 + oy, 5, rim, 0.5);
+  disc(838 + ox, 872 + oy, 7, rim, 0.5);
+  // Body.
+  seg(838, 880, 836, 906, 7, dark, 1);
+  seg(838, 884, 820, 866, 5, dark, 1);
+  seg(838, 884, 856, 864, 5, dark, 1);
+  seg(836, 906, 824, 930, 5, dark, 1);
+  seg(836, 906, 850, 932, 5, dark, 1);
+  disc(838, 872, 7, dark, 1);
+  // Motion streaks behind the leap.
+  seg(812, 900, 796, 912, 2, [200, 190, 170], 0.3);
+  seg(816, 918, 800, 932, 2, [200, 190, 170], 0.25);
+
+  // The toppled chair, lying on its side, legs in the air.
+  const wood: C = [74, 48, 27];
+  const edge: C = [150, 104, 58];
+  quad(906, 942, 46, 10, -0.9, wood, 1);
+  quad(884, 928, 10, 42, -0.9, wood, 1);
+  seg(888, 936, 868, 906, 4, wood, 1);
+  seg(896, 940, 884, 908, 4, wood, 1);
+  seg(918, 948, 936, 916, 4, wood, 1);
+  seg(924, 944, 946, 920, 4, wood, 1);
+  seg(888, 936, 868, 906, 1.6, edge, 0.6);
+  seg(918, 948, 936, 916, 1.6, edge, 0.6);
+}
+
+// ---------------- PNG encoder (own implementation) ----------------
+const CRC_TABLE = ((): Uint32Array => {
+  const table = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
     for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c;
+    table[n] = c >>> 0;
   }
   return table;
 })();
 
-function crc32(buf: Buffer): number {
+function crc32(data: Buffer): number {
   let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  for (let i = 0; i < data.length; i++) {
+    c = CRC_TABLE[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+  }
   return (c ^ 0xffffffff) >>> 0;
 }
 
-function pngChunk(type: string, data: Buffer): Buffer {
+function chunk(type: string, data: Buffer): Buffer {
   const out = Buffer.alloc(12 + data.length);
   out.writeUInt32BE(data.length, 0);
   out.write(type, 4, 'ascii');
   data.copy(out, 8);
-  out.writeUInt32BE(crc32(out.subarray(4, 8 + data.length)), 8 + data.length);
+  out.writeUInt32BE(crc32(Buffer.concat([Buffer.from(type, 'ascii'), data])), 8 + data.length);
   return out;
 }
 
-function encodePNG(width: number, height: number, rgb: Uint8Array): Buffer {
-  const stride = width * 3;
-  const raw = Buffer.alloc((stride + 1) * height);
-  const row = Buffer.alloc(stride);
-  const filt = Buffer.alloc(stride);
-  for (let y = 0; y < height; y++) {
-    row.set(rgb.subarray(y * stride, (y + 1) * stride));
+function paeth(a: number, b: number, c: number): number {
+  const p = a + b - c;
+  const pa = Math.abs(p - a);
+  const pb = Math.abs(p - b);
+  const pc = Math.abs(p - c);
+  if (pa <= pb && pa <= pc) return a;
+  if (pb <= pc) return b;
+  return c;
+}
+
+function encodePNG(w: number, h: number, rgb: Uint8Array): Buffer {
+  const stride = w * 3;
+  const raw = Buffer.alloc(h * (stride + 1));
+  let prev = new Uint8Array(stride);
+  for (let y = 0; y < h; y++) {
+    const row = rgb.subarray(y * stride, (y + 1) * stride);
     let bestType = 0;
-    let bestScore = Infinity;
-    let bestRow: Buffer | null = null;
-    for (let type = 0; type <= 4; type++) {
-      let score = 0;
+    let bestCost = Infinity;
+    let best: Uint8Array = new Uint8Array(stride);
+    for (let t = 0; t < 5; t++) {
+      const f = new Uint8Array(stride);
       for (let i = 0; i < stride; i++) {
-        const a = i >= 3 ? row[i - 3] : 0;
-        const b = y > 0 ? rgb[(y - 1) * stride + i] : 0;
-        const c = i >= 3 && y > 0 ? rgb[(y - 1) * stride + i - 3] : 0;
-        let pred = 0;
-        if (type === 1) pred = a;
-        else if (type === 2) pred = b;
-        else if (type === 3) pred = (a + b) >> 1;
-        else if (type === 4) {
-          const p = a + b - c;
-          const pa = Math.abs(p - a);
-          const pb = Math.abs(p - b);
-          const pc = Math.abs(p - c);
-          pred = pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
-        }
-        const v = (row[i] - pred) & 0xff;
-        filt[i] = v;
-        score += v < 128 ? v : 256 - v;
+        const left = i >= 3 ? row[i - 3] : 0;
+        const up = prev[i];
+        const upLeft = i >= 3 ? prev[i - 3] : 0;
+        let v = row[i];
+        if (t === 1) v = row[i] - left;
+        else if (t === 2) v = row[i] - up;
+        else if (t === 3) v = row[i] - Math.floor((left + up) / 2);
+        else if (t === 4) v = row[i] - paeth(left, up, upLeft);
+        f[i] = v & 0xff;
       }
-      if (score < bestScore) {
-        bestScore = score;
-        bestType = type;
-        bestRow = Buffer.from(filt);
+      let cost = 0;
+      for (let i = 0; i < stride; i++) {
+        const s = f[i] > 127 ? f[i] - 256 : f[i];
+        cost += s < 0 ? -s : s;
+      }
+      if (cost < bestCost) {
+        bestCost = cost;
+        bestType = t;
+        best = f;
       }
     }
-    const off = y * (stride + 1);
-    raw[off] = bestType;
-    (bestRow as Buffer).copy(raw, off + 1);
+    raw[y * (stride + 1)] = bestType;
+    raw.set(best, y * (stride + 1) + 1);
+    prev = row;
   }
   const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
   ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // colour type: truecolor RGB
+  ihdr[9] = 2; // colour type RGB
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
   const idat = deflateSync(raw, { level: 9 });
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk('IHDR', ihdr),
-    pngChunk('IDAT', idat),
-    pngChunk('IEND', Buffer.alloc(0)),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', idat),
+    chunk('IEND', Buffer.alloc(0)),
   ]);
 }
 
-// ---------------------------------------------------------------------------
-// Precomputed fields
-// ---------------------------------------------------------------------------
-
-const W = 1024;
-const H = 1024;
-
-/** Bilinear sample of a square Float32 grid of size gs, at unit coords. */
-function sampleGrid(g: Float32Array, gs: number, x: number, y: number): number {
-  const fx = clamp(x, 0, 0.99999) * gs - 0.5;
-  const fy = clamp(y, 0, 0.99999) * gs - 0.5;
-  const x0 = Math.max(0, Math.floor(fx));
-  const y0 = Math.max(0, Math.floor(fy));
-  const x1 = Math.min(gs - 1, x0 + 1);
-  const y1 = Math.min(gs - 1, y0 + 1);
-  const tx = clamp(fx - x0, 0, 1);
-  const ty = clamp(fy - y0, 0, 1);
-  const a = g[y0 * gs + x0];
-  const b = g[y0 * gs + x1];
-  const c = g[y1 * gs + x0];
-  const d = g[y1 * gs + x1];
-  return a + (b - a) * tx + (c - a) * ty + (a - b - c + d) * tx * ty;
-}
-
-// --- Wave spine: rises from the book, leans left, curls over to the right ---
-// Control points (x, y, radius) in unit space, y down.
-const SPINE_CTRL: [number, number, number][] = [
-  [0.515, 0.878, 0.055],
-  [0.478, 0.722, 0.108],
-  [0.428, 0.566, 0.150],
-  [0.412, 0.416, 0.168],
-  [0.450, 0.286, 0.150],
-  [0.545, 0.196, 0.124],
-  [0.672, 0.163, 0.102],
-  [0.782, 0.191, 0.080],
-  [0.852, 0.263, 0.058],
-  [0.862, 0.359, 0.038],
-  [0.828, 0.449, 0.018],
-];
-// Splash blobs where the wave bursts out of the pages (x, y, radius).
-const BASE_BLOBS: [number, number, number][] = [
-  [0.452, 0.848, 0.020],
-  [0.482, 0.836, 0.026],
-  [0.540, 0.835, 0.025],
-  [0.572, 0.848, 0.019],
-  [0.435, 0.866, 0.015],
-  [0.588, 0.865, 0.014],
-];
-
-interface SpinePt {
-  x: number;
-  y: number;
-  r: number;
-  t: number;
-}
-
-function buildSpine(): SpinePt[] {
-  const pts: SpinePt[] = [];
-  const n = SPINE_CTRL.length;
-  const per = 26;
-  const cr = (p0: number, p1: number, p2: number, p3: number, t: number): number => {
-    const t2 = t * t;
-    const t3 = t2 * t;
-    return 0.5 * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
-  };
-  for (let i = 0; i < n - 1; i++) {
-    const p0 = SPINE_CTRL[Math.max(0, i - 1)];
-    const p1 = SPINE_CTRL[i];
-    const p2 = SPINE_CTRL[i + 1];
-    const p3 = SPINE_CTRL[Math.min(n - 1, i + 2)];
-    for (let k = 0; k < per; k++) {
-      const t = k / per;
-      pts.push({
-        x: cr(p0[0], p1[0], p2[0], p3[0], t),
-        y: cr(p0[1], p1[1], p2[1], p3[1], t),
-        r: Math.max(0.012, cr(p0[2], p1[2], p2[2], p3[2], t)),
-        t: 0,
-      });
-    }
-  }
-  const last = SPINE_CTRL[n - 1];
-  pts.push({ x: last[0], y: last[1], r: last[2], t: 0 });
-  for (let i = 0; i < pts.length; i++) pts[i].t = i / (pts.length - 1);
-  return pts;
-}
-
-const WG = 512;
-const waveD = new Float32Array(WG * WG);
-const waveT = new Float32Array(WG * WG);
-const waveR = new Float32Array(WG * WG);
-const spine = buildSpine();
-
-function buildWaveGrids(): void {
-  for (let gy = 0; gy < WG; gy++) {
-    const y = (gy + 0.5) / WG;
-    for (let gx = 0; gx < WG; gx++) {
-      const x = (gx + 0.5) / WG;
-      let best = Infinity;
-      let bt = 0;
-      let br = 0.05;
-      for (let i = 0; i < spine.length; i++) {
-        const s = spine[i];
-        const d = dist2d(x, y, s.x, s.y) - s.r;
-        if (d < best) {
-          best = d;
-          bt = s.t;
-          br = s.r;
-        }
-      }
-      for (let i = 0; i < BASE_BLOBS.length; i++) {
-        const b = BASE_BLOBS[i];
-        const d = dist2d(x, y, b[0], b[1]) - b[2];
-        if (d < best) {
-          best = d;
-          bt = 0.03;
-          br = b[2];
-        }
-      }
-      const idx = gy * WG + gx;
-      waveD[idx] = best;
-      waveT[idx] = bt;
-      waveR[idx] = br;
-    }
-  }
-}
-
-// --- Noise detail grids (1024) ---
-const NG = 1024;
-const noiseA = new Float32Array(NG * NG); // general fbm, scale 7
-const noiseB = new Float32Array(NG * NG); // vertically stretched streaks
-const noiseC = new Float32Array(NG * NG); // fine foam grain, scale 30
-const noiseD = new Float32Array(NG * NG); // coarse clumps for foam breakup
-const noiseE = new Float32Array(NG * NG); // multi-scale fbm for foam breakup
-
-function buildNoiseGrids(): void {
-  for (let y = 0; y < NG; y++) {
-    const v = (y + 0.5) / NG;
-    for (let x = 0; x < NG; x++) {
-      const u = (x + 0.5) / NG;
-      const idx = y * NG + x;
-      noiseA[idx] = fbm(u * 7 + 3.1, v * 7 + 8.7, 3);
-      noiseB[idx] = fbm(u * 2.6 + 11.3, v * 15 + 1.9, 3);
-      noiseC[idx] = fbm(u * 30 + 5.5, v * 30 + 2.2, 2);
-      noiseD[idx] = vnoise(u * 85 + 13.7, v * 85 + 4.3);
-      noiseE[idx] = fbm(u * 55 + 7.9, v * 55 + 12.4, 3);
-    }
-  }
-}
-
-// --- Glow field (256, single channel warm light) ---
-const GG = 256;
-const glowGrid = new Float32Array(GG * GG);
-
-function splatGlow(cx: number, cy: number, radiusPx: number, intensity: number): void {
-  const gx = cx * GG;
-  const gy = cy * GG;
-  const gr = (radiusPx / W) * GG;
-  const x0 = Math.max(0, Math.floor(gx - gr));
-  const x1 = Math.min(GG - 1, Math.ceil(gx + gr));
-  const y0 = Math.max(0, Math.floor(gy - gr));
-  const y1 = Math.min(GG - 1, Math.ceil(gy + gr));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const d = dist2d(x + 0.5, y + 0.5, gx, gy) / gr;
-      if (d < 1) glowGrid[y * GG + x] += intensity * Math.exp(-d * d * 3.2);
-    }
-  }
-}
-
-function buildGlow(): void {
-  splatGlow(0.5, 0.878, 185, 0.85); // the glowing book
-  splatGlow(0.512, 0.85, 100, 0.45); // splash base
-  splatGlow(0.665, 0.335, 150, 0.38); // the curl's throat
-  splatGlow(0.71, 0.155, 210, 0.68); // gold crest
-  splatGlow(0.408, 0.792, 60, 0.8); // lighthouse lamp
-}
-
-// --- Additive particle buffer (1024, RGB) ---
-const splatBuf = new Float32Array(W * H * 3);
-
-function splat(x: number, y: number, radiusPx: number, col: RGB, intensity: number): void {
-  const cx = x * W;
-  const cy = y * H;
-  const x0 = Math.max(0, Math.floor(cx - radiusPx));
-  const x1 = Math.min(W - 1, Math.ceil(cx + radiusPx));
-  const y0 = Math.max(0, Math.floor(cy - radiusPx));
-  const y1 = Math.min(H - 1, Math.ceil(cy + radiusPx));
-  for (let py = y0; py <= y1; py++) {
-    for (let px = x0; px <= x1; px++) {
-      const d = dist2d(px + 0.5, py + 0.5, cx, cy) / radiusPx;
-      if (d >= 1) continue;
-      const f = Math.exp(-d * d * 3.5) * intensity;
-      const idx = (py * W + px) * 3;
-      splatBuf[idx] += col[0] * f;
-      splatBuf[idx + 1] += col[1] * f;
-      splatBuf[idx + 2] += col[2] * f;
-    }
-  }
-}
-
-const FOAM_COL: RGB = [1.0, 0.88, 0.62];
-const GOLD_COL: RGB = [1.0, 0.62, 0.22];
-
-function buildSplats(): void {
-  const rnd = mulberry32(0x5eed1234);
-  // Spray bursting off the crest and lip (t in [0.55, 1]).
-  for (let i = 0; i < 640; i++) {
-    const t = 0.55 + 0.45 * Math.pow(rnd(), 0.8);
-    const si = Math.min(spine.length - 1, Math.floor(t * (spine.length - 1)));
-    const s = spine[si];
-    const sPrev = spine[Math.max(0, si - 2)];
-    const sNext = spine[Math.min(spine.length - 1, si + 2)];
-    let nx = -(sNext.y - sPrev.y);
-    let ny = sNext.x - sPrev.x;
-    const nl = Math.sqrt(nx * nx + ny * ny) || 1;
-    nx /= nl;
-    ny /= nl;
-    // Outward = away from the curl centre.
-    if ((s.x - 0.665) * nx + (s.y - 0.335) * ny < 0) {
-      nx = -nx;
-      ny = -ny;
-    }
-    const off = s.r * (0.85 + rnd() * 0.5);
-    const scatter = 0.012 + Math.pow(rnd(), 1.6) * 0.10;
-    const dirx = nx * 0.75 + 0.35 + (rnd() - 0.5) * 0.7;
-    const diry = ny * 0.75 - 0.45 + (rnd() - 0.5) * 0.7;
-    const px = s.x + nx * off + dirx * scatter;
-    const py = s.y + ny * off + diry * scatter;
-    const size = 0.8 + rnd() * rnd() * 3.4;
-    splat(px, py, size, FOAM_COL, 0.35 + rnd() * 0.55);
-  }
-  // Droplet streaks flying off the tip: short chains along the motion.
-  for (let i = 0; i < 42; i++) {
-    const t = 0.86 + rnd() * 0.14;
-    const si = Math.min(spine.length - 1, Math.floor(t * (spine.length - 1)));
-    const s = spine[si];
-    const bx = s.x + (rnd() - 0.5) * 0.05;
-    const by = s.y + (rnd() - 0.5) * 0.05;
-    const vx = 0.55 + rnd() * 0.5;
-    const vy = 0.35 + rnd() * 0.55;
-    for (let k = 0; k < 3; k++) {
-      splat(bx + vx * 0.028 * k, by + vy * 0.028 * k, 1.1 + rnd() * 1.6, FOAM_COL, 0.5 - k * 0.13);
-    }
-  }
-  // Splash droplets at the base, leaping off the pages.
-  for (let i = 0; i < 170; i++) {
-    const ang = Math.PI * (0.08 + rnd() * 0.84); // upward arc
-    const rad = 0.03 + Math.pow(rnd(), 1.4) * 0.11;
-    const px = 0.512 + Math.cos(ang) * rad * 1.25;
-    const py = 0.855 - Math.sin(ang) * rad;
-    splat(px, py, 0.8 + rnd() * rnd() * 3.0, FOAM_COL, 0.3 + rnd() * 0.5);
-  }
-  // Tiny stars inside the wave body.
-  let placed = 0;
-  let guard = 0;
-  while (placed < 130 && guard < 6000) {
-    guard++;
-    const px = 0.24 + rnd() * 0.66;
-    const py = 0.03 + rnd() * 0.80;
-    const d = sampleGrid(waveD, WG, px, py);
-    if (d > -0.02) continue;
-    const warm = rnd();
-    const col: RGB = warm < 0.6 ? GOLD_COL : [0.85, 0.92, 1.0];
-    splat(px, py, 0.7 + rnd() * 1.3, col, 0.5 + rnd() * 0.8);
-    placed++;
-  }
-  // Dust motes drifting in the lighthouse beam.
-  const lampX = 0.408;
-  const lampY = 0.792;
-  const bdx = -0.885;
-  const bdy = -0.465;
-  for (let i = 0; i < 90; i++) {
-    const along = 0.04 + rnd() * 0.55;
-    const perp = (rnd() - 0.5) * (0.012 + along * 0.16);
-    const px = lampX + bdx * along - bdy * perp;
-    const py = lampY + bdy * along + bdx * perp;
-    splat(px, py, 0.7 + rnd() * 1.1, [1.0, 0.8, 0.5], 0.10 + rnd() * 0.22);
-  }
-  // Ambient motes in the book's glow.
-  for (let i = 0; i < 110; i++) {
-    const px = 0.28 + rnd() * 0.44;
-    const py = 0.45 + rnd() * 0.42;
-    splat(px, py, 0.6 + rnd() * 1.0, [1.0, 0.75, 0.42], 0.05 + rnd() * 0.13);
-  }
-  // Big soft foreground droplets — spray flying at the viewer, kept near
-  // the crest and the frame's lower corners so they read as near-camera
-  // water, not smudges on the room.
-  for (let i = 0; i < 14; i++) {
-    let px: number;
-    let py: number;
-    if (i < 8) {
-      px = 0.55 + rnd() * 0.43;
-      py = 0.04 + rnd() * 0.46;
-    } else {
-      px = rnd() < 0.5 ? rnd() * 0.20 : 0.80 + rnd() * 0.20;
-      py = 0.62 + rnd() * 0.34;
-    }
-    splat(px, py, 13 + rnd() * 30, [0.75, 0.85, 1.0], 0.04 + rnd() * 0.07);
-    splat(px - 0.006, py - 0.008, 4 + rnd() * 6, [1.0, 0.95, 0.85], 0.08 + rnd() * 0.10);
-  }
-}
-
-// --- Bookshelf layout (seeded) ---
-interface BookDef {
-  x0: number;
-  x1: number;
-  h: number;
-  lean: number;
-  col: RGB;
-  band: boolean;
-}
-interface ShelfRow {
-  top: number;
-  boardY: number;
-  books: BookDef[];
-}
-const SHELF_PALETTE: RGB[] = [
-  [0.30, 0.15, 0.11],
-  [0.36, 0.21, 0.12],
-  [0.15, 0.24, 0.20],
-  [0.32, 0.25, 0.13],
-  [0.20, 0.15, 0.26],
-  [0.38, 0.24, 0.15],
-  [0.13, 0.20, 0.26],
-  [0.28, 0.13, 0.15],
-  [0.24, 0.28, 0.14],
-  [0.34, 0.28, 0.20],
-];
-const shelfRows: ShelfRow[] = [];
-
-function buildShelves(): void {
-  const rnd = mulberry32(0xb00c5);
-  for (let side = 0; side < 2; side++) {
-    const ux0 = side === 0 ? 0.014 : 0.800;
-    const ux1 = side === 0 ? 0.200 : 0.986;
-    for (let r = 0; r < 5; r++) {
-      const top = 0.048 + r * 0.163;
-      const boardY = top + 0.148;
-      const books: BookDef[] = [];
-      let x = ux0 + 0.006 + rnd() * 0.006;
-      while (x < ux1 - 0.02) {
-        if (rnd() < 0.10) {
-          x += 0.012 + rnd() * 0.02; // a gap on the shelf
-          continue;
-        }
-        const w = 0.015 + rnd() * 0.019;
-        const h = 0.088 + rnd() * 0.048;
-        const lean = rnd() < 0.14 ? (rnd() - 0.5) * 0.035 : 0;
-        const col = SHELF_PALETTE[Math.floor(rnd() * SHELF_PALETTE.length)];
-        books.push({ x0: x, x1: Math.min(x + w, ux1 - 0.004), h, lean, col, band: rnd() < 0.45 });
-        x += w + 0.0016;
-      }
-      shelfRows.push({ top, boardY, books });
-    }
-  }
-}
-
-// --- Fluttering loose pages caught in the spray ---
-interface PageDef {
-  cx: number;
-  cy: number;
-  hx: number;
-  hy: number;
-  rot: number;
-  bright: number;
-}
-const flutterPages: PageDef[] = [];
-
-function buildPages(): void {
-  const rnd = mulberry32(0xf17e5);
-  for (let i = 0; i < 9; i++) {
-    const w = 0.030 + rnd() * 0.028;
-    flutterPages.push({
-      cx: 0.56 + rnd() * 0.36,
-      cy: 0.30 + rnd() * 0.36,
-      hx: w / 2,
-      hy: (w * 0.72) / 2,
-      rot: rnd() * Math.PI * 2,
-      bright: 0.7 + rnd() * 0.5,
-    });
-  }
-  for (let i = 0; i < 2; i++) {
-    const w = 0.034 + rnd() * 0.02;
-    flutterPages.push({
-      cx: 0.30 + rnd() * 0.13,
-      cy: 0.55 + rnd() * 0.15,
-      hx: w / 2,
-      hy: (w * 0.72) / 2,
-      rot: rnd() * Math.PI * 2,
-      bright: 0.65 + rnd() * 0.4,
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Scene shapes (unit space, y down)
-// ---------------------------------------------------------------------------
-
-/** Point in quad via two triangles; returns [u, v] or null. u: gutter->outer. */
-function quadUV(
-  x: number, y: number,
-  gT: [number, number], oT: [number, number], oB: [number, number], gB: [number, number],
-): [number, number] | null {
-  const tri = (
-    ax: number, ay: number, bx: number, by: number, cx: number, cy: number,
-  ): [number, number, number] | null => {
-    const v0x = bx - ax;
-    const v0y = by - ay;
-    const v1x = cx - ax;
-    const v1y = cy - ay;
-    const v2x = x - ax;
-    const v2y = y - ay;
-    const den = v0x * v1y - v1x * v0y;
-    if (Math.abs(den) < 1e-9) return null;
-    const u = (v2x * v1y - v1x * v2y) / den;
-    const v = (v0x * v2y - v2x * v0y) / den;
-    if (u < -0.001 || v < -0.001 || u + v > 1.001) return null;
-    return [u, v, 1 - u - v];
-  };
-  // Triangle gutterTop - outerTop - gutterBottom: uv (0,0),(1,0),(0,1).
-  // tri() returns [weight of b, weight of c, weight of a].
-  let b = tri(gT[0], gT[1], oT[0], oT[1], gB[0], gB[1]);
-  if (b) return [b[0], b[1]];
-  // Triangle outerTop - outerBottom - gutterBottom: uv (1,0),(1,1),(0,1).
-  b = tri(oT[0], oT[1], oB[0], oB[1], gB[0], gB[1]);
-  if (b) return [b[2] + b[0], b[0] + b[1]];
-  return null;
-}
-
-/** The tiny lighthouse on the left page: SDF (negative inside). */
-function lighthouseD(x: number, y: number): number {
-  let d = sdCapsule(x, y, 0.408, 0.866, 0.408, 0.806, 0.0135);
-  d = Math.min(d, dist2d(x, y, 0.408, 0.864) - 0.019); // base flare
-  d = Math.min(d, sdBox(x, y, 0.408, 0.801, 0.0155, 0.005, 0)); // gallery
-  d = Math.min(d, sdBox(x, y, 0.408, 0.790, 0.0088, 0.0078, 0)); // lamp room
-  // Roof: small triangle approximated by a clipped disc.
-  const roof = Math.max(dist2d(x, y, 0.408, 0.786) - 0.0105, y - 0.7845);
-  d = Math.min(d, roof);
-  return d;
-}
-
-/** The startled reader, leaping back: SDF built from capsules, local frame
- *  rotated about the feet so the whole body tips away from the book. */
-function readerD(x: number, y: number): number {
-  const fx = 0.762;
-  const fy = 0.912;
-  const rot = -0.42; // tip back, away from the wave (wave is to the left)
-  const c = Math.cos(rot);
-  const s = Math.sin(rot);
-  const dx = x - fx;
-  const dy = y - fy;
-  const lx = c * dx - s * dy;
-  const ly = s * dx + c * dy;
-  const px = lx;
-  const py = ly;
-  let d = sdCapsule(px, py, 0, -0.004, 0.004, -0.054, 0.0115); // torso
-  d = Math.min(d, dist2d(px, py, 0.009, -0.068) - 0.0105); // head
-  d = Math.min(d, sdCapsule(px, py, 0.002, -0.049, -0.017, -0.059, 0.0046)); // front arm up
-  d = Math.min(d, sdCapsule(px, py, -0.017, -0.059, -0.021, -0.077, 0.0042));
-  d = Math.min(d, sdCapsule(px, py, 0.004, -0.050, 0.017, -0.057, 0.0046)); // back arm flung
-  d = Math.min(d, sdCapsule(px, py, 0.017, -0.057, 0.027, -0.071, 0.0042));
-  d = Math.min(d, sdCapsule(px, py, 0.001, -0.006, 0.016, -0.025, 0.0052)); // trailing leg
-  d = Math.min(d, sdCapsule(px, py, 0.016, -0.025, 0.031, -0.009, 0.0046));
-  d = Math.min(d, sdCapsule(px, py, 0.0, -0.006, -0.011, -0.028, 0.0052)); // planted leg
-  d = Math.min(d, sdCapsule(px, py, -0.011, -0.028, -0.015, -0.002, 0.0046));
-  return d;
-}
-
-/** The toppling chair: SDF from rotated boxes. */
-function chairD(x: number, y: number): number {
-  const cx = 0.852;
-  const cy = 0.918;
-  const rot = 0.95; // falling away to the right
-  const c = Math.cos(rot);
-  const s = Math.sin(rot);
-  const dx = x - cx;
-  const dy = y - cy;
-  const lx = c * dx + s * dy;
-  const ly = -s * dx + c * dy;
-  let d = sdBox(lx, ly, 0, -0.030, 0.0042, 0.030, 0); // back upright
-  d = Math.min(d, sdBox(lx, ly, 0.001, -0.058, 0.017, 0.0038, 0)); // back top rail
-  d = Math.min(d, sdBox(lx, ly, 0.002, 0.0, 0.019, 0.0042, 0)); // seat
-  d = Math.min(d, sdBox(lx, ly, -0.015, 0.016, 0.0036, 0.017, 0)); // front leg
-  d = Math.min(d, sdBox(lx, ly, 0.017, 0.016, 0.0036, 0.017, 0)); // back leg
-  return d;
-}
-
-/** Rim light factor for a silhouette SDF: edge band facing the book's glow. */
-function rimLight(dFn: (x: number, y: number) => number, x: number, y: number, d: number): number {
-  if (d > 0.001 || d < -0.009) return 0;
-  const e = 0.0028;
-  const gx = (dFn(x + e, y) - dFn(x - e, y)) / (2 * e);
-  const gy = (dFn(x, y + e) - dFn(x, y - e)) / (2 * e);
-  const gl = Math.sqrt(gx * gx + gy * gy) || 1;
-  const nx = gx / gl;
-  const ny = gy / gl;
-  // Direction toward the book's glow at (0.5, 0.88).
-  let lx = 0.5 - x;
-  let ly = 0.88 - y;
-  const ll = Math.sqrt(lx * lx + ly * ly) || 1;
-  lx /= ll;
-  ly /= ll;
-  const facing = clamp01(nx * lx + ny * ly);
-  const band = smoothstep(-0.009, -0.0008, d);
-  return Math.pow(facing, 1.6) * band;
-}
-
-// ---------------------------------------------------------------------------
-// Per-pixel shading (unit coords, returns linear HDR colour)
-// ---------------------------------------------------------------------------
-
-const GOLD: RGB = [1.0, 0.62, 0.24];
-const GLOW_TINT: RGB = [1.0, 0.66, 0.32];
-
-function shelfShade(x: number, y: number, glow: number): RGB | null {
-  const left = x < 0.5;
-  const ux0 = left ? 0.008 : 0.794;
-  const ux1 = left ? 0.206 : 0.992;
-  if (x < ux0 || x > ux1) return null;
-  // Unit frame.
-  const frame: RGB = [0.045, 0.032, 0.022];
-  if (x < ux0 + 0.008 || x > ux1 - 0.008) return frame;
-  const rowIdx = Math.floor((y - 0.048) / 0.163);
-  if (rowIdx < 0 || rowIdx > 4) return frame;
-  const row = shelfRows[(left ? 0 : 1) * 5 + rowIdx];
-  // Backing panel.
-  let col: RGB = [0.020, 0.016, 0.013];
-  // Shelf board.
-  if (y > row.boardY - 0.011) {
-    const t = (y - (row.boardY - 0.011)) / 0.011;
-    col = [0.075 * (1 - t * 0.5), 0.052 * (1 - t * 0.5), 0.032 * (1 - t * 0.5)];
-    if (y < row.boardY - 0.0085) col = [0.11, 0.078, 0.046]; // lit top edge of board
-    return col;
-  }
-  // Books.
-  for (let i = 0; i < row.books.length; i++) {
-    const b = row.books[i];
-    const f = clamp((row.boardY - y) / b.h, 0, 1); // 0 at board, 1 at top
-    if (f > 1) continue;
-    const shift = b.lean * f;
-    if (x < b.x0 + shift || x > b.x1 + shift) continue;
-    if (y < row.boardY - b.h) continue;
-    const u = (x - shift - b.x0) / (b.x1 - b.x0);
-    const edge = Math.min(u, 1 - u);
-    let shade = 0.55 + 0.45 * smoothstep(0, 0.30, edge); // rounded spine
-    shade *= 0.82 + 0.30 * f; // darker toward the board
-    shade *= 0.8 + 0.35 * hash2(i * 7 + rowIdx * 31, left ? 3 : 9);
-    col = [b.col[0] * shade, b.col[1] * shade, b.col[2] * shade];
-    if (b.band && Math.abs(f - 0.78) < 0.035) {
-      col = [col[0] + 0.10, col[1] + 0.075, col[2] + 0.03]; // gilt band
-    }
-    // Warm rim on the side facing the room's light.
-    const inner = left ? smoothstep(0.55, 1.0, u) : smoothstep(0.45, 0.0, u);
-    const rim = inner * (0.25 + glow * 1.1) * 0.5;
-    col = [col[0] + GOLD[0] * rim * 0.35, col[1] + GOLD[1] * rim * 0.35, col[2] + GOLD[2] * rim * 0.35];
-    return col;
-  }
-  return col;
-}
-
-function shade(x: number, y: number): RGB {
-  // Wave field first (drives shadow + halo on the room behind it).
-  const d0 = sampleGrid(waveD, WG, x, y);
-  const wt = sampleGrid(waveT, WG, x, y);
-  const wr = sampleGrid(waveR, WG, x, y);
-  const nA = sampleGrid(noiseA, NG, x, y);
-  const nB = sampleGrid(noiseB, NG, x, y);
-  const nC = sampleGrid(noiseC, NG, x, y);
-  const nD = sampleGrid(noiseD, NG, x, y);
-  const nE = sampleGrid(noiseE, NG, x, y);
-  const glow = sampleGrid(glowGrid, GG, x, y);
-  const disp = (nA - 0.5) * (0.010 + 0.030 * smoothstep(0.45, 1.0, wt)) + (nC - 0.5) * 0.004;
-  const d = d0 + disp;
-  const ao = d > 0 ? 1 - 0.38 * smoothstep(0.10, 0.004, d) : 1;
-
-  // --- Wall ---
-  let col: RGB = [
-    mix(0.030, 0.012, y) + 0.012 * nA,
-    mix(0.028, 0.011, y) + 0.008 * nA,
-    mix(0.048, 0.022, y) + 0.010 * nA,
-  ];
-  col = [
-    col[0] + GLOW_TINT[0] * glow * 0.16,
-    col[1] + GLOW_TINT[1] * glow * 0.16,
-    col[2] + GLOW_TINT[2] * glow * 0.16,
-  ];
-
-  // --- Shelves ---
-  if ((x < 0.21 || x > 0.79) && y < 0.85) {
-    const s = shelfShade(x, y, glow);
-    if (s) col = s;
-  }
-  col = [col[0] * ao, col[1] * ao, col[2] * ao];
-
-  // --- Table ---
-  if (y > 0.836) {
-    const streak = 0.88 + 0.24 * nA;
-    let tcol: RGB;
-    if (y < 0.972) {
-      // Surface: warm pool of light around the book.
-      const pool = Math.exp(-(Math.pow((x - 0.5) / 0.30, 2) + Math.pow((y - 0.905) / 0.09, 2)));
-      const base: RGB = [0.115, 0.070, 0.040];
-      tcol = [
-        base[0] * streak + GOLD[0] * pool * 0.26,
-        base[1] * streak + GOLD[1] * pool * 0.26,
-        base[2] * streak + GOLD[2] * pool * 0.26,
-      ];
-      // Soft shadow the wave throws on the table behind the book.
-      const sh = Math.exp(-(Math.pow((x - 0.52) / 0.21, 2) + Math.pow((y - 0.862) / 0.045, 2)));
-      tcol = [tcol[0] * (1 - 0.4 * sh), tcol[1] * (1 - 0.4 * sh), tcol[2] * (1 - 0.4 * sh)];
-    } else {
-      const g = 1 - (y - 0.972) / 0.028;
-      tcol = [0.055 * g * streak + 0.012, 0.034 * g * streak + 0.008, 0.020 * g * streak + 0.005];
-    }
-    col = [tcol[0] * ao, tcol[1] * ao, tcol[2] * ao];
-  }
-
-  // --- A stack of closed books on the left of the table ---
-  if (x > 0.17 && x < 0.335 && y > 0.845 && y < 0.925) {
-    const stack: [number, number, number, number, number, RGB][] = [
-      [0.252, 0.903, 0.052, 0.011, 0.03, [0.30, 0.15, 0.11]],
-      [0.250, 0.882, 0.046, 0.010, -0.05, [0.15, 0.24, 0.20]],
-      [0.253, 0.862, 0.040, 0.009, 0.09, [0.36, 0.21, 0.12]],
-    ];
-    for (let i = 0; i < stack.length; i++) {
-      const [bcx, bcy, bhx, bhy, brot, bcol] = stack[i];
-      const bd = sdBox(x, y, bcx, bcy, bhx, bhy, brot);
-      if (bd < 0.0012) {
-        const lit = 0.55 + 0.5 * glow + 0.25 * nA;
-        col = mixc(col, [bcol[0] * lit, bcol[1] * lit, bcol[2] * lit], smoothstep(0.0012, -0.0012, bd));
-      }
-    }
-  }
-
-  // --- The open book ---
-  if (x > 0.29 && x < 0.73 && y > 0.82 && y < 0.945) {
-    // Cover (slightly larger, dark red-brown).
-    const cov = quadUV(x, y, [0.5, 0.843], [0.313, 0.866], [0.320, 0.930], [0.5, 0.920]);
-    const covR = quadUV(x, y, [0.5, 0.843], [0.687, 0.866], [0.680, 0.930], [0.5, 0.920]);
-    if (cov || covR) col = [0.115, 0.048, 0.034];
-    // Pages.
-    const pl = quadUV(x, y, [0.5, 0.851], [0.327, 0.871], [0.333, 0.921], [0.5, 0.911]);
-    const pr = quadUV(x, y, [0.5, 0.851], [0.673, 0.871], [0.667, 0.921], [0.5, 0.911]);
-    const pg = pl || pr;
-    if (pg) {
-      const u = pg[0];
-      const v = pg[1];
-      const glowSrc = Math.exp(-(Math.pow(x - 0.5, 2) / 0.012 + Math.pow(y - 0.878, 2) / 0.0035));
-      let bright = 0.34 + 1.05 * glowSrc;
-      bright *= 1 - 0.30 * u * u; // page curls down toward the outer edge
-      bright *= 0.92 + 0.14 * Math.sin(v * Math.PI); // soft top-bottom falloff
-      bright *= 0.96 + 0.08 * nA;
-      const edge = Math.min(u, 1 - u, v * 1.6, (1 - v) * 1.6);
-      bright *= 0.82 + 0.18 * smoothstep(0, 0.10, edge);
-      col = [1.02 * bright, 0.80 * bright, 0.50 * bright];
-    }
-  }
-
-  // --- Lighthouse on the left page ---
-  if (x > 0.375 && x < 0.445 && y > 0.76 && y < 0.885) {
-    const ld = lighthouseD(x, y);
-    if (ld < 0.0012) {
-      const rim = rimLight(lighthouseD, x, y, ld);
-      const a = smoothstep(0.0012, -0.0012, ld);
-      const lc: RGB = [
-        0.016 + GOLD[0] * rim * 0.9,
-        0.022 + GOLD[1] * rim * 0.9,
-        0.038 + GOLD[2] * rim * 0.9,
-      ];
-      col = mixc(col, lc, a);
-      // The lamp itself.
-      const lampD = dist2d(x, y, 0.408, 0.7905);
-      if (lampD < 0.0048) {
-        const li = smoothstep(0.0048, 0.0012, lampD);
-        col = mixc(col, [2.3, 1.85, 1.05], li);
-      }
-    }
-  }
-
-  // --- The wave ---
-  if (d < 0.004) {
-    const depth = clamp(-d / Math.max(wr * 0.95, 0.05), 0, 1);
-    const shell = 1 - depth;
-    // Deep indigo body; teal light lives only in a thinner outer shell.
-    let wcol = mixc([0.075, 0.295, 0.355], [0.008, 0.038, 0.105], smoothstep(0.0, 0.55, Math.pow(depth, 0.8)));
-    const shadeVar = 0.76 + 0.52 * nA;
-    wcol = [wcol[0] * shadeVar, wcol[1] * shadeVar, wcol[2] * shadeVar];
-    // Flow streaks running along the tube (parameterised by spine t).
-    const flow = vnoise(wt * 30 + nA * 2.0, depth * 3.0 + wt * 4.0);
-    const flowI = Math.pow(flow, 2.0) * (0.35 + 0.65 * shell) * 0.20;
-    wcol = [wcol[0] + 0.05 * flowI * 3, wcol[1] + 0.11 * flowI * 3, wcol[2] + 0.12 * flowI * 3];
-    // Fine ripple texture on the lit shell.
-    const rip = ((nC - 0.5) * 0.07 + (nD - 0.5) * 0.03) * shell;
-    wcol = [wcol[0] + rip, wcol[1] + rip, wcol[2] + rip];
-    // Molten-gold filaments threading the water (ridged streak noise).
-    const crestF = smoothstep(0.66, 0.98, wt);
-    const fil = Math.pow(1 - Math.abs(2 * nB - 1), 6);
-    const filI = fil * (0.10 + 0.34 * crestF + 0.30 * glow) * (0.30 + 0.70 * shell);
-    wcol = [wcol[0] + GOLD[0] * filI, wcol[1] + GOLD[1] * filI, wcol[2] + GOLD[2] * filI];
-    // Gold light raking the crest.
-    const goldI = crestF * (0.25 + 0.75 * shell) * 1.0;
-    wcol = [wcol[0] + GOLD[0] * goldI, wcol[1] + GOLD[1] * goldI, wcol[2] + GOLD[2] * goldI];
-    // Warm light from the book and throat glow.
-    const glowI = glow * 0.32 * (1 - depth * 0.5);
-    wcol = [wcol[0] + GOLD[0] * glowI, wcol[1] + GOLD[1] * glowI, wcol[2] + GOLD[2] * glowI];
-    // Specular glints near the crest surface.
-    const spec = smoothstep(0.63, 0.95, nC) * crestF * shell;
-    wcol = [wcol[0] + spec * 0.42, wcol[1] + spec * 0.34, wcol[2] + spec * 0.21];
-    // Foam — intensity modulated by soft multi-scale noise so it breaks
-    // into ragged clumps, never a clean outline or mosaic: a noisy band at
-    // the surface, a ragged cap at the tip, lining in the throat of the
-    // curl, and churn where the wave leaves the pages.
-    const patchSoft = smoothstep(0.14, 0.84, nE * 0.7 + nC * 0.3);
-    const foamI = 0.30 + 0.70 * patchSoft;
-    const band = 0.008 + 0.034 * nC * (0.4 + 0.8 * crestF);
-    let foamM = smoothstep(-band, -band * 0.15, d) * foamI * (0.55 + 0.45 * crestF);
-    foamM = Math.max(foamM, smoothstep(0.78, 0.96, wt) * smoothstep(0.85, 0.30, depth) * (0.40 + 0.60 * patchSoft));
-    const distC = dist2d(x, y, 0.665, 0.335);
-    foamM = Math.max(foamM, smoothstep(0.165, 0.125, distC) * smoothstep(-0.002, -0.030, d) * foamI);
-    const distBase = dist2d(x, y, 0.512, 0.856);
-    foamM = Math.max(foamM, smoothstep(0.074, 0.040, distBase) * smoothstep(-0.001, -0.014, d) * foamI);
-    foamM = clamp01(foamM);
-    if (foamM > 0.003) {
-      const foamCol = mixc([1.0, 0.78, 0.46], [1.05, 0.97, 0.87], nC);
-      const fb = (0.80 + 0.24 * nE) * (0.9 + 0.35 * crestF);
-      wcol = mixc(wcol, [foamCol[0] * fb, foamCol[1] * fb, foamCol[2] * fb], foamM);
-    }
-    const a = smoothstep(0.0028, -0.0028, d);
-    col = mixc(col, wcol, a);
-  }
-
-  // --- Fluttering pages in the spray ---
-  for (let i = 0; i < flutterPages.length; i++) {
-    const p = flutterPages[i];
-    if (Math.abs(x - p.cx) > p.hx + 0.02 || Math.abs(y - p.cy) > p.hx + 0.02) continue;
-    const pd = sdBox(x, y, p.cx, p.cy, p.hx, p.hy, p.rot);
-    if (pd < 0.0012) {
-      const c = Math.cos(p.rot);
-      const s = Math.sin(p.rot);
-      const lu = (c * (x - p.cx) + s * (y - p.cy)) / p.hx; // -1..1 across
-      const fold = 1 - 0.28 * Math.abs(lu); // crease shading
-      const pb = p.bright * fold * (0.92 + 0.16 * nA);
-      const pc: RGB = [1.0 * pb, 0.79 * pb, 0.50 * pb];
-      col = mixc(col, pc, smoothstep(0.0012, -0.0012, pd));
-    }
-  }
-
-  // --- Reader + chair silhouettes ---
-  if (x > 0.70 && x < 0.85 && y > 0.78 && y < 0.935) {
-    const rd = readerD(x, y);
-    if (rd < 0.0012) {
-      const rim = rimLight(readerD, x, y, rd);
-      const rc: RGB = [
-        0.010 + GOLD[0] * rim * 1.15,
-        0.014 + GOLD[1] * rim * 1.15,
-        0.026 + GOLD[2] * rim * 1.15,
-      ];
-      col = mixc(col, rc, smoothstep(0.0012, -0.0012, rd));
-    }
-  }
-  if (x > 0.79 && x < 0.94 && y > 0.82 && y < 0.97) {
-    const cd = chairD(x, y);
-    if (cd < 0.0012) {
-      const rim = rimLight(chairD, x, y, cd);
-      const cc: RGB = [
-        0.030 + GOLD[0] * rim * 0.7,
-        0.020 + GOLD[1] * rim * 0.7,
-        0.012 + GOLD[2] * rim * 0.7,
-      ];
-      col = mixc(col, cc, smoothstep(0.0012, -0.0012, cd));
-    }
-  }
-
-  // --- Lighthouse beam, cutting through the spray ---
-  {
-    const lx = 0.408;
-    const ly = 0.7905;
-    const bdx = -0.885;
-    const bdy = -0.465;
-    const px = x - lx;
-    const py = y - ly;
-    const along = px * bdx + py * bdy;
-    if (along > 0 && along < 0.66) {
-      const perp = Math.abs(px * -bdy + py * bdx);
-      const width = 0.006 + along * 0.085;
-      const beam = Math.exp(-Math.pow(perp / width, 2)) * (1 - along / 0.66) * 0.34;
-      col = [col[0] + beam * 1.0, col[1] + beam * 0.82, col[2] + beam * 0.52];
-    }
-  }
-
-  // --- Particles + glow (additive) ---
-  const si = (Math.min(H - 1, Math.floor(y * H)) * W + Math.min(W - 1, Math.floor(x * W))) * 3;
-  col = [
-    col[0] + splatBuf[si] + GLOW_TINT[0] * glow * 0.34,
-    col[1] + splatBuf[si + 1] + GLOW_TINT[1] * glow * 0.34,
-    col[2] + splatBuf[si + 2] + GLOW_TINT[2] * glow * 0.34,
-  ];
-
-  // --- Vignette ---
-  const vd = dist2d(x, y, 0.5, 0.46);
-  const vig = 1 - 0.46 * smoothstep(0.52, 1.02, vd);
-  col = [col[0] * vig, col[1] * vig, col[2] * vig];
-  return col;
-}
-
-// ---------------------------------------------------------------------------
-// Render: 2x supersampling, filmic shoulder, seeded grain
-// ---------------------------------------------------------------------------
-
-function render(): Uint8Array {
-  buildWaveGrids();
-  buildNoiseGrids();
-  buildGlow();
-  buildShelves();
-  buildPages();
-  buildSplats();
-
-  const acc = new Float32Array(W * H * 3);
-  const SS = 2;
-  const offs = [0.25, 0.75];
-  for (let py = 0; py < H; py++) {
-    for (let px = 0; px < W; px++) {
-      let r = 0;
-      let g = 0;
-      let b = 0;
-      for (let sy = 0; sy < SS; sy++) {
-        for (let sx = 0; sx < SS; sx++) {
-          const c = shade((px + offs[sx]) / W, (py + offs[sy]) / H);
-          r += c[0];
-          g += c[1];
-          b += c[2];
-        }
-      }
-      const idx = (py * W + px) * 3;
-      acc[idx] = r / 4;
-      acc[idx + 1] = g / 4;
-      acc[idx + 2] = b / 4;
-    }
-  }
-
-  const out = new Uint8Array(W * H * 3);
-  for (let py = 0; py < H; py++) {
-    for (let px = 0; px < W; px++) {
-      const idx = (py * W + px) * 3;
-      const grain = (hash2(px * 3 + 17, py * 3 + 91) - 0.5) * 0.013;
-      for (let ch = 0; ch < 3; ch++) {
-        let v = acc[idx + ch];
-        v = 1 - Math.exp(-v * 1.5); // filmic shoulder
-        v = Math.pow(Math.max(v, 0), 0.92);
-        const luma = 0.35 + 0.65 * (1 - v);
-        v += grain * luma * (ch === 2 ? 0.8 : 1);
-        out[idx + ch] = Math.round(clamp01(v) * 255);
-      }
-    }
-  }
-  return out;
-}
-
+// ---------------- main ----------------
 function main(): void {
-  const t0 = performance.now();
-  const rgb = render();
+  paintBackground();
+  paintShelves();
+  paintTable();
+  paintLightWash();
+  paintBook();
+  paintLighthouse();
+  paintWave();
+  paintSpray();
+  paintPages();
+  paintReaderChair();
+
+  // Vignette: darken the corners so the centre glows.
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const dx = (x + 0.5 - W / 2) / (W / 2);
+      const dy = (y + 0.5 - H / 2) / (H / 2);
+      const d2 = dx * dx + dy * dy;
+      let v = (d2 - 0.5) / 0.9;
+      if (v < 0) v = 0;
+      if (v > 1) v = 1;
+      const f = 1 - 0.45 * Math.pow(v, 1.5);
+      const i = (y * W + x) * 3;
+      buf[i] *= f;
+      buf[i + 1] *= f;
+      buf[i + 2] *= f;
+    }
+  }
+
+  // Film grain (its own seeded stream, so it is deterministic too).
+  const grain = mulberry32(0x9e3779b9);
+  const GRAIN = 2;
+  for (let i = 0; i < W * H * 3; i++) {
+    buf[i] += (grain() - 0.5) * GRAIN;
+  }
+
+  const rgb = new Uint8Array(W * H * 3);
+  for (let i = 0; i < W * H * 3; i++) {
+    const v = buf[i];
+    rgb[i] = v <= 0 ? 0 : v >= 255 ? 255 : Math.round(v);
+  }
   const png = encodePNG(W, H, rgb);
   const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
   mkdirSync(outDir, { recursive: true });
-  writeFileSync(join(outDir, 'entry.png'), png);
-  const ms = Math.round(performance.now() - t0);
-  console.log(`entry.png: ${W}x${H}, ${png.length} bytes, rendered in ${ms} ms`);
+  const outPath = join(outDir, 'entry.png');
+  writeFileSync(outPath, png);
+  const hash = createHash('sha256').update(png).digest('hex');
+  console.log(`entry.png ${W}x${H} ${png.length} bytes sha256=${hash}`);
 }
 
 main();
