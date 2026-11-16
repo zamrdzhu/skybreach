@@ -12,6 +12,14 @@
 // fixed-seed PRNG drives every placement — no Math.random, no clock — so two
 // runs produce byte-identical output.
 //
+// Pipeline, in order: the wave's Catmull-Rom spine is baked into distance /
+// parameter / radius grids; five noise fields and a warm glow field are
+// precomputed alongside; every spray droplet, star, mote and fluttering page
+// is splatted into an additive buffer by seeded PRNGs; then each output
+// pixel shades the room, the book, the wave and the silhouettes from those
+// fields at 2x supersampling, and a filmic shoulder plus seeded grain finish
+// the frame before the hand-rolled PNG encoder writes it out.
+//
 // Node 22, standard library only. Writes <outputDir>/entry.png where
 // outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output'.
 
